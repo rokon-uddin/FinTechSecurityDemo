@@ -121,7 +121,7 @@ enum MockBackend {
 
     static func issueTransactionNonce() -> String {
         let nonce = UUID().uuidString + "-" + String(Int64(Date.now.timeIntervalSince1970))
-        nonceLock.withLock {
+        _ = nonceLock.withLock {
             usedNonces.insert(nonce)
         }
         return nonce

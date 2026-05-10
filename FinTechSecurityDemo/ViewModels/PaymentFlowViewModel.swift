@@ -37,62 +37,34 @@ struct StepLogEntry: Identifiable {
 @MainActor
 final class PaymentFlowViewModel {
 
-    // MARK: - Flow State
+    // MARK: - Flow State (UI-observed)
 
     var currentStep = 0
     var isProcessing = false
     var flowComplete = false
     var errorMessage: String?
-    
     var stepLogs: [StepLogEntry] = []
-    
-    // MARK: Step 0 — Device Security
-    var deviceSecurityPassed = false
-    var jailbreakPassed = false
-    var biometricStateChanged = false
-    var isSimulatorEnvironment = false
-    var deviceCheckSummary: [(label: String, status: String)] = []
 
-    // MARK: Step 1 — Login
+    // MARK: - UI-Bound Inputs
+
     var walletInput = "01800000001"
     var pinInput = "1234"
-    var loginResult: AuthTokenBundle?
-    
-    // MARK: Step 2 — Session
-    var sessionClaims: JWTClaims?
-    var accessTokenPreview = ""
-    var refreshTokenPreview = ""
-    
-    // MARK: Step 3 — ECDH Key Exchange
-    var clientPubKeyHex = ""
-    var serverPubKeyHex = ""
-    var derivedKeyHex = ""
-    var ecdhSessionId = ""
     var receiverWallet = "01555000999"
     var amountText = "2500.00"
     var paymentNote = "Rent payment"
-    var transactionNonce = ""
-    var builtTransaction: Transaction?
     var cardNumber = "4242424242424242"
-    var paymentToken: PaymentToken?
-    var signatureDER: Data?
+
+    // MARK: - UI-Observed Step Results
+
+    var deviceSecurityPassed = false
+    var deviceCheckSummary: [(label: String, status: String)] = []
+    var sessionClaims: JWTClaims?
+    var accessTokenPreview = ""
+    var builtTransaction: Transaction?
     var signatureHex = ""
-    var publicKeyHex = ""
-    var signingKeySource = ""
     var encryptedEnvelope: EncryptedEnvelope?
     var hmacSignatureHex = ""
-    var nonceHex = ""
-    var ciphertextPreview = ""
-    var tagHex = ""
     var verificationResult: VerificationResult?
-
-    // MARK: Step 8 — TLS Transmit
-    var certPinHash = ""
-    var tlsTransmitComplete = false
-
-    // MARK: Step 10 — Response & Cleanup
-    var serverResponseJSON = ""
-    var memoryWipeComplete = false
 
     // MARK: - Dependencies
 
@@ -102,7 +74,12 @@ final class PaymentFlowViewModel {
     private let verificationService: any TransactionVerificationServiceProtocol
     private let auditLog: any AuditLogServiceProtocol
 
-    // MARK: Internal crypto state
+    // MARK: - Internal State (cross-method, not UI-accessed)
+
+    private var loginResult: AuthTokenBundle?
+    private var ecdhSessionId = ""
+    private var transactionNonce = ""
+    private var signatureDER: Data?
     private var clientPrivateKey: P256.KeyAgreement.PrivateKey?
     private var sessionKey: SymmetricKey?
     private var hmacKey: SymmetricKey?
@@ -156,7 +133,7 @@ final class PaymentFlowViewModel {
         for (name, passed) in jbChecks {
             logs.append("[JAILBREAK] \(passed ? "✓" : "✗") \(name)")
         }
-        jailbreakPassed = jbChecks.allSatisfy(\.1)
+        let jailbreakPassed = jbChecks.allSatisfy(\.1)
         logs.append(
             "[JAILBREAK] Overall: \(jailbreakPassed ? "✓ No jailbreak indicators" : "✗ JAILBREAK DETECTED — would abort in production")"
         )
@@ -164,11 +141,11 @@ final class PaymentFlowViewModel {
         // 2. Environment Detection
         logs.append("[ENV] Checking execution environment...")
         let seAvailable = SecureEnclave.isAvailable
-        isSimulatorEnvironment = !seAvailable
+        let isSimulator = !seAvailable
 
         let envChecks: [(String, Bool)] = [
             ("Secure Enclave available", seAvailable),
-            ("Running on physical device", !isSimulatorEnvironment),
+            ("Running on physical device", !isSimulator),
             ("Debugger not attached (P_TRACED)", true),
             ("Code signature valid", true),
         ]
@@ -177,7 +154,7 @@ final class PaymentFlowViewModel {
             logs.append("[ENV] \(passed ? "✓" : "⚠") \(name)")
         }
 
-        if isSimulatorEnvironment {
+        if isSimulator {
             logs.append("[ENV] ⚠ Simulator detected — software fallbacks will be used")
             logs.append("[ENV] ⚠ In production: App Attest would fail on simulator")
         }
@@ -189,11 +166,12 @@ final class PaymentFlowViewModel {
         let bioAvailable = context.canEvaluatePolicy(
             .deviceOwnerAuthenticationWithBiometrics, error: &bioError)
 
+        var biometricChanged = false
         if bioAvailable {
-            let currentState = context.evaluatedPolicyDomainState
+            let currentState = context.domainState.biometry.stateHash
             if let stored = storedBiometricState, let current = currentState {
-                biometricStateChanged = stored != current
-                if biometricStateChanged {
+                biometricChanged = stored != current
+                if biometricChanged {
                     logs.append("[BIO] ⚠ Biometric enrollment CHANGED since last check")
                     logs.append(
                         "[BIO] ⚠ New fingerprint/face enrolled — force re-authentication")
@@ -203,13 +181,11 @@ final class PaymentFlowViewModel {
             } else {
                 storedBiometricState = currentState
                 logs.append("[BIO] ✓ Biometric state baseline captured")
-                biometricStateChanged = false
             }
         } else {
             logs.append(
-                "[BIO] \(isSimulatorEnvironment ? "⚠ Biometrics unavailable (Simulator)" : "✗ No biometric hardware")"
+                "[BIO] \(isSimulator ? "⚠ Biometrics unavailable (Simulator)" : "✗ No biometric hardware")"
             )
-            biometricStateChanged = false
         }
 
         deviceSecurityPassed = jailbreakPassed
@@ -221,7 +197,7 @@ final class PaymentFlowViewModel {
             ),
             (
                 "Biometric Enrollment",
-                biometricStateChanged
+                biometricChanged
                     ? "⚠ Changed" : (bioAvailable ? "✓ Unchanged" : "⚠ Unavailable")
             ),
             ("Environment Integrity", "✓ Validated"),
@@ -283,7 +259,7 @@ final class PaymentFlowViewModel {
             loginResult = bundle
             sessionClaims = bundle.claims
             accessTokenPreview = String(bundle.accessToken.prefix(40)) + "..."
-            refreshTokenPreview = String(bundle.refreshToken.prefix(20)) + "..."
+            let refreshTokenPreview = String(bundle.refreshToken.prefix(20)) + "..."
 
             logs.append(
                 "[AUTH] Login succeeded — sessionId: \(bundle.claims.sessionId.prefix(8))..."
@@ -417,7 +393,7 @@ final class PaymentFlowViewModel {
         let clientPrivKey = P256.KeyAgreement.PrivateKey()
         self.clientPrivateKey = clientPrivKey
         let clientPubData = clientPrivKey.publicKey.rawRepresentation
-        clientPubKeyHex = clientPubData.hexString
+        let clientPubKeyHex = clientPubData.hexString
 
         logs.append(
             "[ECDH] Client public key: \(clientPubKeyHex.prefix(32))... (\(clientPubData.count) bytes)"
@@ -429,7 +405,7 @@ final class PaymentFlowViewModel {
         )
 
         let serverPubData = serverResult.serverResponse.serverPublicKeyData
-        serverPubKeyHex = serverPubData.hexString
+        let serverPubKeyHex = serverPubData.hexString
         ecdhSessionId = serverResult.serverResponse.sessionId
 
         logs.append("[ECDH] Server generated ephemeral P-256 key pair")
@@ -463,7 +439,7 @@ final class PaymentFlowViewModel {
             outputByteCount: 32
         )
         self.sessionKey = derived
-        derivedKeyHex = derived.withUnsafeBytes { Data($0).hexString }
+        let derivedKeyHex = derived.withUnsafeBytes { Data($0).hexString }
 
         let derivedHMAC = sharedSecret.hkdfDerivedSymmetricKey(
             using: SHA256.self,
@@ -653,7 +629,6 @@ final class PaymentFlowViewModel {
 
         do {
             let token = try await tokenService.tokenize(request: request)
-            paymentToken = token
 
             logs.append("[PCI] Gateway returned token: \(token.id)")
             logs.append("[PCI] Last four: \(token.lastFour) (safe for display)")
@@ -738,6 +713,8 @@ final class PaymentFlowViewModel {
                 logs.append("[SE] Existing key found")
             }
 
+            var signingKeySource = ""
+            var publicKeyHex = ""
             if let info = await signingService.keyInfo() {
                 signingKeySource = info.sourceDescription
                 registeredPublicKey = info.publicKeyData
@@ -855,10 +832,8 @@ final class PaymentFlowViewModel {
                 nonce: nonce
             )
 
-            nonceHex = Data(nonce).hexString
-            ciphertextPreview =
-                sealedBox.ciphertext.prefix(20).hexString + "..."
-            tagHex = sealedBox.tag.hexString
+            let nonceHex = Data(nonce).hexString
+            let tagHex = sealedBox.tag.hexString
 
             let envelope = EncryptedEnvelope(
                 nonce: Data(nonce),
@@ -969,7 +944,7 @@ final class PaymentFlowViewModel {
         logs.append("[PIN] Strategy: Public key (SPKI) pinning")
         let mockCertData = "api.fintech.example.com-production-2026".data(using: .utf8)!
         let pinHash = SHA256.hash(data: mockCertData)
-        certPinHash = Data(pinHash).hexString
+        let certPinHash = Data(pinHash).hexString
         logs.append("[PIN] Expected SPKI SHA-256: \(certPinHash.prefix(32))...")
         logs.append("[PIN] Server certificate SPKI: \(certPinHash.prefix(32))...")
         logs.append("[PIN] Pin match: ✓ Certificate trusted")
@@ -996,8 +971,6 @@ final class PaymentFlowViewModel {
         logs.append(
             "[TX] Body: \(encryptedEnvelope?.ciphertext.count ?? 0) bytes (AES-GCM encrypted)")
         logs.append("[TX] ✓ 200 OK — \(Int.random(in: 45...120))ms round-trip")
-
-        tlsTransmitComplete = true
 
         PaymentFlowLogger.network.info("✓ TLS transmission complete")
 
@@ -1227,8 +1200,6 @@ final class PaymentFlowViewModel {
         if let jsonData = try? JSONSerialization.data(
             withJSONObject: responsePayload, options: .prettyPrinted)
         {
-            let responseJSON = String(data: jsonData, encoding: .utf8) ?? ""
-
             do {
                 let nonce = AES.GCM.Nonce()
                 let sealedResponse = try AES.GCM.seal(jsonData, using: key, nonce: nonce)
@@ -1242,13 +1213,11 @@ final class PaymentFlowViewModel {
 
                 logs.append("[RESPONSE] Decrypting response with session key...")
                 let decrypted = try AES.GCM.open(sealedResponse, using: key)
-                serverResponseJSON =
-                    String(data: decrypted, encoding: .utf8) ?? ""
+                let responseJSON = String(data: decrypted, encoding: .utf8) ?? ""
                 logs.append("[RESPONSE] ✓ Response decrypted and verified")
-                logs.append("[RESPONSE] \(serverResponseJSON.prefix(80))...")
+                logs.append("[RESPONSE] \(responseJSON.prefix(80))...")
             } catch {
                 logs.append("[RESPONSE] ✗ Decryption failed: \(error)")
-                serverResponseJSON = responseJSON
             }
         }
 
@@ -1278,8 +1247,6 @@ final class PaymentFlowViewModel {
             "[WIPE] Note: Data objects use resetBytes(in:) to overwrite"
         )
         logs.append("[WIPE] ✓ Sensitive data cleared from application memory")
-
-        memoryWipeComplete = true
 
         PaymentFlowLogger.flow.info("✓ Response handled, memory wiped")
 
@@ -1330,45 +1297,37 @@ final class PaymentFlowViewModel {
     // MARK: - Reset
 
     func resetFlow() {
+        // Flow state
         currentStep = 0
         isProcessing = false
         flowComplete = false
         errorMessage = nil
         stepLogs.removeAll()
-        loginResult = nil
-        sessionClaims = nil
-        accessTokenPreview = ""
-        refreshTokenPreview = ""
-        clientPubKeyHex = ""
-        serverPubKeyHex = ""
-        derivedKeyHex = ""
-        ecdhSessionId = ""
+
+        // UI-bound inputs
+        walletInput = "01800000001"
+        pinInput = "1234"
         receiverWallet = "01555000999"
         amountText = "2500.00"
         paymentNote = "Rent payment"
-        transactionNonce = ""
-        builtTransaction = nil
         cardNumber = "4242424242424242"
-        paymentToken = nil
-        signatureDER = nil
+
+        // UI-observed step results
+        deviceSecurityPassed = false
+        deviceCheckSummary = []
+        sessionClaims = nil
+        accessTokenPreview = ""
+        builtTransaction = nil
         signatureHex = ""
-        publicKeyHex = ""
-        signingKeySource = ""
         encryptedEnvelope = nil
         hmacSignatureHex = ""
-        nonceHex = ""
-        ciphertextPreview = ""
-        tagHex = ""
         verificationResult = nil
-        certPinHash = ""
-        serverResponseJSON = ""
-        memoryWipeComplete = false
-        deviceSecurityPassed = false
-        jailbreakPassed = false
-        biometricStateChanged = false
-        isSimulatorEnvironment = false
-        deviceCheckSummary = []
-        tlsTransmitComplete = false
+
+        // Internal cross-method state
+        loginResult = nil
+        ecdhSessionId = ""
+        transactionNonce = ""
+        signatureDER = nil
         clientPrivateKey = nil
         sessionKey = nil
         hmacKey = nil
