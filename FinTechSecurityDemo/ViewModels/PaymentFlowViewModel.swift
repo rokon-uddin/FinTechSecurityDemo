@@ -105,6 +105,7 @@ final class PaymentFlowViewModel {
     // MARK: Internal crypto state
     private var clientPrivateKey: P256.KeyAgreement.PrivateKey?
     private var sessionKey: SymmetricKey?
+    private var hmacKey: SymmetricKey?
     private var registeredPublicKey: Data?
     private var hmacBody: Data?
     private var storedBiometricState: Data?
@@ -450,9 +451,10 @@ final class PaymentFlowViewModel {
         logs.append(
             "[ECDH] Shared secret computed (both sides get identical result)"
         )
-        logs.append("[HKDF] Deriving 256-bit session key with HKDF-SHA256")
-        logs.append("[HKDF] Salt: \"fintech-session-v1\"")
-        logs.append("[HKDF] Info: sessionId (domain separation)")
+        logs.append("[HKDF] Deriving keys with HKDF-SHA256 (domain separation)")
+        logs.append("[HKDF] Key 1 salt: \"fintech-session-v1\" → AES-GCM session key")
+        logs.append("[HKDF] Key 2 salt: \"fintech-hmac-v1\" → HMAC signing key")
+        logs.append("[HKDF] Info: sessionId (binds keys to this session)")
 
         let derived = sharedSecret.hkdfDerivedSymmetricKey(
             using: SHA256.self,
@@ -463,16 +465,31 @@ final class PaymentFlowViewModel {
         self.sessionKey = derived
         derivedKeyHex = derived.withUnsafeBytes { Data($0).hexString }
 
+        let derivedHMAC = sharedSecret.hkdfDerivedSymmetricKey(
+            using: SHA256.self,
+            salt: "fintech-hmac-v1".data(using: .utf8)!,
+            sharedInfo: ecdhSessionId.data(using: .utf8)!,
+            outputByteCount: 32
+        )
+        self.hmacKey = derivedHMAC
+        let hmacKeyHex = derivedHMAC.withUnsafeBytes { Data($0).hexString }
+
         logs.append(
-            "[HKDF] Derived key: \(derivedKeyHex.prefix(32))... (256-bit AES key)"
+            "[HKDF] Session key: \(derivedKeyHex.prefix(32))... (256-bit AES)"
         )
         logs.append(
-            "[ECDH] Client key matches server key: \(derivedKeyHex == serverResult.sharedSecret.hexString)"
+            "[HKDF] HMAC key: \(hmacKeyHex.prefix(32))... (256-bit HMAC)"
+        )
+        logs.append(
+            "[ECDH] Session key matches server: \(derivedKeyHex == serverResult.sharedSessionKey.hexString)"
+        )
+        logs.append(
+            "[ECDH] HMAC key matches server: \(hmacKeyHex == serverResult.sharedHMACKey.hexString)"
         )
         logs.append("[PFS] Ephemeral keys provide Perfect Forward Secrecy")
         logs.append("[ECDH] Client private key will be discarded after session")
 
-        PaymentFlowLogger.crypto.info("✓ ECDH complete — session key derived")
+        PaymentFlowLogger.crypto.info("✓ ECDH complete — session + HMAC keys derived")
 
         stepLogs.append(
             StepLogEntry(
@@ -480,7 +497,7 @@ final class PaymentFlowViewModel {
                 title: "ECDH Key Exchange + HKDF",
                 securityTopics: [
                     "ECDH P-256", "HKDF Key Derivation",
-                    "Perfect Forward Secrecy", "Ephemeral Keys",
+                    "Perfect Forward Secrecy", "Domain Separation",
                 ],
                 side: .both,
                 requestParams: [
@@ -495,12 +512,18 @@ final class PaymentFlowViewModel {
                     ("Server Public Key", serverPubKeyHex.prefix(40) + "..."),
                     ("ECDH Session ID", ecdhSessionId),
                     ("Derived Session Key", derivedKeyHex.prefix(40) + "..."),
-                    ("Key Derivation", "HKDF-SHA256"),
-                    ("Salt", "\"fintech-session-v1\""),
-                    ("Output", "256-bit symmetric key (AES-GCM)"),
+                    ("Derived HMAC Key", hmacKeyHex.prefix(40) + "..."),
+                    ("Key Derivation", "HKDF-SHA256 (2 keys, domain-separated)"),
+                    ("Session Key Salt", "\"fintech-session-v1\""),
+                    ("HMAC Key Salt", "\"fintech-hmac-v1\""),
                     (
-                        "Keys Match",
-                        derivedKeyHex == serverResult.sharedSecret.hexString
+                        "Session Keys Match",
+                        derivedKeyHex == serverResult.sharedSessionKey.hexString
+                            ? "YES" : "NO"
+                    ),
+                    (
+                        "HMAC Keys Match",
+                        hmacKeyHex == serverResult.sharedHMACKey.hexString
                             ? "YES" : "NO"
                     ),
                     (
@@ -857,15 +880,21 @@ final class PaymentFlowViewModel {
             )
 
             logs.append("[HMAC] Computing HMAC-SHA256 over request body")
+            logs.append("[HMAC] Key: derived from ECDH shared secret via HKDF (step 3)")
             logs.append(
                 "[HMAC] Covers: method + path + timestamp + nonce + body hash"
             )
+
+            guard let hmacKey else {
+                errorMessage = "HMAC key not available — complete ECDH key exchange first"
+                return
+            }
 
             let bodyForHMAC = try JSONEncoder().encode(envelope)
             self.hmacBody = bodyForHMAC
             let hmacCode = HMAC<SHA256>.authenticationCode(
                 for: bodyForHMAC,
-                using: MockBackend.hmacSecret
+                using: hmacKey
             )
             hmacSignatureHex = Data(hmacCode).hexString
 
@@ -874,7 +903,7 @@ final class PaymentFlowViewModel {
                 "[HMAC] Prevents request tampering even if TLS is compromised"
             )
             logs.append(
-                "[HMAC] Server verifies with constant-time comparison (prevents timing attacks)"
+                "[HMAC] Server verifies with its own ECDH-derived key (constant-time comparison)"
             )
 
             PaymentFlowLogger.crypto.info("✓ Encrypted + HMAC signed")
@@ -893,7 +922,7 @@ final class PaymentFlowViewModel {
                         ("Encryption Key", "ECDH-derived session key (step 2)"),
                         ("AES Mode", "GCM (Galois/Counter Mode)"),
                         ("Key Size", "256-bit"),
-                        ("HMAC Key", "Shared secret (device registration)"),
+                        ("HMAC Key", "ECDH-derived (HKDF, \"fintech-hmac-v1\")"),
                     ],
                     responseData: [
                         ("Nonce (IV)", nonceHex),
@@ -1018,13 +1047,14 @@ final class PaymentFlowViewModel {
 
         logs.append("[SERVER] ═══ Server-Side Verification Pipeline ═══")
 
-        // 1) HMAC Verification
+        // 1) HMAC Verification (using server's ECDH-derived HMAC key for this session)
         logs.append(
-            "[SERVER] Step 1: Verifying HMAC-SHA256 request signature..."
+            "[SERVER] Step 1: Verifying HMAC-SHA256 with session-derived key..."
         )
         let hmacResult = MockBackend.verifyHMACSignature(
             body: body,
-            signatureHex: hmacSignatureHex
+            signatureHex: hmacSignatureHex,
+            sessionId: ecdhSessionId
         )
         logs.append(
             "[SERVER] HMAC: \(hmacResult.valid ? "✓ VALID" : "✗ INVALID")"
@@ -1341,6 +1371,7 @@ final class PaymentFlowViewModel {
         tlsTransmitComplete = false
         clientPrivateKey = nil
         sessionKey = nil
+        hmacKey = nil
         registeredPublicKey = nil
         hmacBody = nil
     }

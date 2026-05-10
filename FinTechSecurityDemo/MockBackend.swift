@@ -107,6 +107,11 @@ enum MockBackend {
         return Data(bytes)
     }())
 
+    // MARK: - Per-Session HMAC Keys (derived during ECDH key agreement)
+    // In production: stored in server-side session store (Redis/DB) alongside the session.
+    private static var sessionHMACKeys: [String: SymmetricKey] = [:]
+    private static var hmacKeyLock = NSLock()
+
     // MARK: - Nonce Store (prevents replay attacks)
     // In production: stored in Redis/database with TTL.
     private static var usedNonces = Set<String>()
@@ -165,15 +170,31 @@ enum MockBackend {
         let message: String
     }
 
+    /// Verify HMAC using a per-session key derived during ECDH key agreement.
+    static func verifyHMACSignature(body: Data, signatureHex: String, sessionId: String) -> HMACVerifyResult {
+        let key: SymmetricKey? = hmacKeyLock.withLock { sessionHMACKeys[sessionId] }
+
+        guard let key else {
+            return .init(valid: false, message: "✗ No HMAC key found for session \(sessionId.prefix(8))...")
+        }
+
+        return verifyHMAC(body: body, signatureHex: signatureHex, key: key)
+    }
+
+    /// Verify HMAC using the static shared secret (standalone HMAC demo only).
     static func verifyHMACSignature(body: Data, signatureHex: String) -> HMACVerifyResult {
-        let expectedMAC = HMAC<SHA256>.authenticationCode(for: body, using: hmacSecret)
+        verifyHMAC(body: body, signatureHex: signatureHex, key: hmacSecret)
+    }
+
+    private static func verifyHMAC(body: Data, signatureHex: String, key: SymmetricKey) -> HMACVerifyResult {
+        let expectedMAC = HMAC<SHA256>.authenticationCode(for: body, using: key)
         let expectedHex = Data(expectedMAC).hexString
 
         // Constant-time comparison (prevents timing attacks)
         let valid = HMAC<SHA256>.isValidAuthenticationCode(
             Data(hexString: signatureHex) ?? Data(),
             authenticating: body,
-            using: hmacSecret
+            using: key
         )
         return .init(
             valid: valid,
@@ -192,7 +213,7 @@ enum MockBackend {
 
     static func performECDHKeyAgreement(
         clientPublicKeyData: Data
-    ) -> (serverResponse: ECDHServerResponse, sharedSecret: Data) {
+    ) -> (serverResponse: ECDHServerResponse, sharedSessionKey: Data, sharedHMACKey: Data) {
         // Server generates its own ephemeral key pair
         let serverPrivKey = P256.KeyAgreement.PrivateKey()
         let serverPubKey  = serverPrivKey.publicKey
@@ -203,8 +224,10 @@ enum MockBackend {
         // ECDH: compute shared secret
         let sharedSecret = try! serverPrivKey.sharedSecretFromKeyAgreement(with: clientPubKey)
 
-        // Derive session key using HKDF (same as client will do)
+        // Derive TWO keys via HKDF with domain separation (different salts)
         let sessionId = UUID().uuidString
+
+        // Key 1: AES-GCM session key
         let sessionKey = sharedSecret.hkdfDerivedSymmetricKey(
             using: SHA256.self,
             salt: "fintech-session-v1".data(using: .utf8)!,
@@ -212,13 +235,26 @@ enum MockBackend {
             outputByteCount: 32
         )
 
-        // Return server's public key so client can derive the same secret
+        // Key 2: HMAC signing key (domain-separated from session key)
+        let hmacKey = sharedSecret.hkdfDerivedSymmetricKey(
+            using: SHA256.self,
+            salt: "fintech-hmac-v1".data(using: .utf8)!,
+            sharedInfo: sessionId.data(using: .utf8)!,
+            outputByteCount: 32
+        )
+
+        // Server stores the HMAC key for later verification
+        hmacKeyLock.withLock {
+            sessionHMACKeys[sessionId] = hmacKey
+        }
+
         return (
             serverResponse: ECDHServerResponse(
                 serverPublicKeyData: serverPubKey.rawRepresentation,
                 sessionId: sessionId
             ),
-            sharedSecret: sessionKey.withUnsafeBytes { Data($0) }  // Server stores this; returned here for demo visibility
+            sharedSessionKey: sessionKey.withUnsafeBytes { Data($0) },
+            sharedHMACKey: hmacKey.withUnsafeBytes { Data($0) }
         )
     }
 

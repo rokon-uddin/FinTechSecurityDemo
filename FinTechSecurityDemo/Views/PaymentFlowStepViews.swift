@@ -230,7 +230,7 @@ struct KeyExchangeStepView: View {
             SectionCard(title: "Establish Encrypted Channel", icon: "🤝", accent: accent) {
                 VStack(spacing: 12) {
                     InfoCallout(
-                        text: "Both sides generate ephemeral P-256 key pairs, exchange public keys, and independently compute the same shared secret via ECDH. HKDF derives a 256-bit AES key. Ephemeral keys = Perfect Forward Secrecy.",
+                        text: "Both sides generate ephemeral P-256 key pairs, exchange public keys, and compute the same shared secret via ECDH. HKDF derives TWO 256-bit keys with domain separation: one for AES-GCM encryption, one for HMAC signing. Ephemeral keys = Perfect Forward Secrecy.",
                         icon: "lock.rotation",
                         accent: accent
                     )
@@ -440,7 +440,7 @@ struct EncryptionStepView: View {
 
                     FieldRow(label: "Encryption Key", value: "ECDH session key (step 2)", mono: true)
                     FieldRow(label: "Algorithm", value: "AES-256-GCM (AEAD)", mono: true)
-                    FieldRow(label: "HMAC Key", value: "Shared secret (device registration)", mono: true)
+                    FieldRow(label: "HMAC Key", value: "ECDH-derived (HKDF, \"fintech-hmac-v1\")", mono: true)
 
                     PrimaryButton(
                         label: "Encrypt + HMAC Sign",

@@ -67,17 +67,17 @@ final class ECDHViewModel {
 
         let clientPubKeyData = clientPrivKey.publicKey.rawRepresentation
 
-        let (serverResp, serverKeyBytes) = MockBackend.performECDHKeyAgreement(
+        let result = MockBackend.performECDHKeyAgreement(
             clientPublicKeyData: clientPubKeyData
         )
 
-        serverPubKeyHex      = serverResp.serverPublicKeyData.hexString
-        sessionId            = serverResp.sessionId
-        serverDerivedKeyHex  = serverKeyBytes.hexString
+        serverPubKeyHex      = result.serverResponse.serverPublicKeyData.hexString
+        sessionId            = result.serverResponse.sessionId
+        serverDerivedKeyHex  = result.sharedSessionKey.hexString
 
         do {
             let serverPubKey = try P256.KeyAgreement.PublicKey(
-                rawRepresentation: serverResp.serverPublicKeyData
+                rawRepresentation: result.serverResponse.serverPublicKeyData
             )
 
             let sharedSecret = try clientPrivKey.sharedSecretFromKeyAgreement(
